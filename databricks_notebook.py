@@ -1,33 +1,39 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Deploy the scale-to-zero echo/fortune cold-start endpoint
+# MAGIC # Deploy the scale-to-zero echo/fortune endpoint (STANDARD WORKSPACE ONLY)
 # MAGIC
-# MAGIC Run this INSIDE a Databricks notebook (not a laptop). Because the notebook is
-# MAGIC already Linux, already the right Python, and already authenticated, it sidesteps
-# MAGIC the three things that blocked the laptop deploy (absolute Windows path, Python
-# MAGIC 3.12, and OAuth token juggling).
+# MAGIC ## Read this first
 # MAGIC
-# MAGIC Two cells: (1) register the model, (2) create the scale-to-zero endpoint. Then
-# MAGIC watch it build under **Serving** in the left nav.
+# MAGIC **This notebook does NOT work on Databricks Free Edition.** On Free Edition the
+# MAGIC serverless compute that runs a notebook is explicitly denied permission to save a
+# MAGIC model to storage, so the first cell fails with an S3 `AccessDenied` error. On Free
+# MAGIC Edition, register from a local machine instead - see `register_byvalue.py` and
+# MAGIC `DEPLOYMENT.md`.
+# MAGIC
+# MAGIC On a **standard (paid) workspace**, this notebook is the simplest path: it runs as
+# MAGIC you, on Databricks compute, already authenticated - so there is no token juggling.
+# MAGIC Two cells: (1) register the model, (2) create the scale-to-zero endpoint. Then watch
+# MAGIC it build under **Serving** in the left nav.
 
 # COMMAND ----------
 
 # ---- Cell 1: register the model to Unity Catalog ----
 import random
+
 import mlflow
 import pandas as pd
 
-# Change these for your workspace (office: use a catalog/schema you own):
+# Change these for your workspace (use a catalog/schema you own):
 CATALOG = "workspace"
 SCHEMA = "default"
 MODEL = f"{CATALOG}.{SCHEMA}.coldstart_echo_fortune"
 
+# Provenance is deliberately clean for corporate / open-source review: original lines
+# plus short PUBLIC-DOMAIN (pre-1929) quotations only. NOT the Unix fortunes database.
 FORTUNES = [
     "Simplicity is the ultimate sophistication.",
     "Cold starts are honest: the wait is the replica waking, not the model thinking.",
     "Measure twice, cut once.",
-    "A slow system that tells the truth beats a fast one that lies.",
-    "You have power over your mind, not outside events. - Marcus Aurelius",
     "A journey of a thousand miles begins with a single step. - Lao Tzu",
     "We suffer more often in imagination than in reality. - Seneca",
     "It does not matter how slowly you go as long as you do not stop. - Confucius",
@@ -98,7 +104,7 @@ print("Now watch it build under Serving in the left nav (~10 min).")
 # MAGIC %md
 # MAGIC ## Test it once it is READY
 # MAGIC
-# MAGIC Use the **Query endpoint** button on the Serving page, or run:
+# MAGIC Use the **Query endpoint** button on the Serving page, or run the cell below.
 
 # COMMAND ----------
 

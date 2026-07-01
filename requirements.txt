@@ -1,2 +1,4 @@
-mlflow>=2.12.0
+# Pinned to MLflow 2.x: register_byvalue.py uses log_model(artifact_path=...),
+# which MLflow 3.x renamed to `name=`. 2.x keeps this script runnable as written.
+mlflow>=2.17,<3
 pandas>=2.0.0

@@ -1,35 +1,37 @@
-"""Register the echo model by VALUE (no code path, no module import).
+"""The echo/fortune model, and a script to register it to Unity Catalog.
 
-The class is defined here in __main__ and logged as an INSTANCE, so cloudpickle
-serializes the class BY VALUE into python_model.pkl. There is no model_code_path
-(the Windows-absolute-path problem) and no `import model` at serving time (the
-by-reference problem). Fortunes are a class attribute so they are captured too.
+Importing this module gives you the model class with NO side effects - safe for a
+local smoke test (see the README). Running it as a script registers the model to
+Databricks.
 
-Run from the laptop (the only identity that can write the model to UC on Free
-Edition):
-  DATABRICKS_HOST=... DATABRICKS_TOKEN=... MLFLOW_EXPERIMENT=/Users/<you>/... python register_byvalue.py
+The model is logged BY VALUE (the class instance is pickled), so there is no source
+file path baked into the model. That is the detail that lets it load on the Linux
+serving container no matter which OS you register from - the reason this approach
+works where logging a code file did not.
+
+Register (from any machine with the Databricks CLI authenticated):
+
+    DATABRICKS_HOST=https://<host> DATABRICKS_TOKEN=<token> \\
+    MLFLOW_EXPERIMENT=/Users/<you>/coldstart-echo-fortune \\
+    python register_byvalue.py
+
+See DEPLOYMENT.md for how to get the token and why these env vars are needed.
 """
 
 from __future__ import annotations
 
 import os
+import random
 
-import mlflow
 import mlflow.pyfunc
 import pandas as pd
 
-mlflow.set_tracking_uri("databricks")
-mlflow.set_registry_uri("databricks-uc")
-EXP = os.environ.get("MLFLOW_EXPERIMENT")
-if EXP:
-    mlflow.set_experiment(EXP)
-
-CATALOG = os.environ.get("UC_CATALOG", "workspace")
-SCHEMA = os.environ.get("UC_SCHEMA", "default")
-MODEL = f"{CATALOG}.{SCHEMA}.coldstart_echo_fortune"
-
 
 class EchoFortuneModel(mlflow.pyfunc.PythonModel):
+    # Provenance is deliberately clean for corporate / open-source review: every
+    # line is either original to this repo or a short PUBLIC-DOMAIN (pre-1929)
+    # quotation. This is intentionally NOT the Unix `fortunes` database, whose
+    # individual entries have undocumented provenance.
     FORTUNES = [
         "Simplicity is the ultimate sophistication.",
         "Cold starts are honest: the wait is the replica waking, not the model thinking.",
@@ -44,8 +46,6 @@ class EchoFortuneModel(mlflow.pyfunc.PythonModel):
     ]
 
     def predict(self, context, model_input, params=None):
-        import random
-
         if isinstance(model_input, pd.DataFrame):
             rows = model_input.to_dict(orient="records")
         elif isinstance(model_input, dict):
@@ -59,13 +59,33 @@ class EchoFortuneModel(mlflow.pyfunc.PythonModel):
         return out
 
 
-if __name__ == "__main__":
-    with mlflow.start_run(run_name="coldstart-echo-byvalue"):
+def _register() -> None:
+    """Log + register the model to Unity Catalog. Talks to Databricks; run as a script."""
+
+    import mlflow
+
+    mlflow.set_tracking_uri("databricks")
+    mlflow.set_registry_uri("databricks-uc")
+    experiment = os.environ.get("MLFLOW_EXPERIMENT")
+    if experiment:
+        mlflow.set_experiment(experiment)
+
+    catalog = os.environ.get("UC_CATALOG", "workspace")
+    schema = os.environ.get("UC_SCHEMA", "default")
+    model = f"{catalog}.{schema}.coldstart_echo_fortune"
+
+    with mlflow.start_run(run_name="coldstart-echo-fortune"):
         info = mlflow.pyfunc.log_model(
-            artifact_path="model",
+            artifact_path="model",  # MLflow 2.x; on 3.x this argument is named `name`
             python_model=EchoFortuneModel(),
             input_example=pd.DataFrame([{"prompt": "hello"}]),
             pip_requirements=["mlflow", "pandas"],
-            registered_model_name=MODEL,
+            registered_model_name=model,
         )
-    print("VERSION", info.registered_model_version)
+
+    print("Registered", model, "version", info.registered_model_version)
+    print("Next: set entity_version in endpoint_config.json to this version, then create the endpoint.")
+
+
+if __name__ == "__main__":
+    _register()

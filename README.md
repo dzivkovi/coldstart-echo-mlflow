@@ -1,63 +1,62 @@
 # coldstart-echo-mlflow
 
-A deliberately tiny MLflow pyfunc you deploy as a **scale-to-zero Model Serving endpoint** to reproduce and **measure** Databricks cold starts. It echoes your request and appends a random offline fortune - no weights, no network. The only latency it adds over a warm call is the platform cold start (waking a replica), which is exactly what we want to measure.
+A deliberately tiny MLflow model you deploy as a **scale-to-zero Databricks Model Serving endpoint**, so you can reproduce and **measure a real cold start**. It just echoes your request and adds a random offline quote - no model weights, no network calls. The only time it adds over a warm call is the platform cold start (a replica waking up), which is exactly what we want to measure.
+
+New to MLflow or Databricks? Start with **Run it locally** below - that part needs no Databricks account at all.
 
 ## Why this exists (and why it is NOT a Databricks App)
 
-- A **Databricks App** stays warm while Running - it has no per-request cold start, so it is useless for measuring one.
-- A **Model Serving endpoint** with `scale_to_zero_enabled=true` suspends after idle and cold-starts on the first request. That is the behavior the office dispatcher shows, because the dispatcher is also a scale-to-zero pyfunc.
-- The cold start is **platform behavior**: it is the replica waking, not the code running. So a six-line echo cold-starts the same as a heavy app. That is the whole reason this harness is valid: keep it trivial, measure the platform.
+- A **Databricks App** stays warm while it is running - it has no per-request cold start, so it is useless for measuring one.
+- A **Model Serving endpoint** with `scale_to_zero_enabled=true` suspends after it sits idle and cold-starts on the first request. That is the behaviour a real request-router serving endpoint shows, because such a router is also a scale-to-zero pyfunc model.
+- The cold start is **platform behaviour**: it is the replica waking, not your code running. A six-line echo cold-starts the same as a heavy service. That is the whole reason this trivial harness is valid - keep it tiny, and you are measuring the platform, not the model.
 
-Related: the `genai-coldstart-guard` POC (the classification facade + the endpoint-state model) and the `coldstart-guard-databricks-app` bundle (the web-app version, which does NOT cold-start).
+Companion projects: `genai-coldstart-guard` (the cold-start classification facade + the endpoint-state model) and `coldstart-guard-databricks-app` (a web-app version, which does NOT cold-start).
 
 ## Files
 
-- `model.py` - the `EchoFortuneModel` pyfunc.
-- `fortunes.txt` - offline quotes (the model's only artifact).
-- `register_model.py` - logs + registers the model to Unity Catalog.
-- `endpoint_config.json` - serving endpoint config (scale-to-zero, Small).
-- `requirements.txt` - `mlflow`, `pandas`.
+- `register_byvalue.py` - the model class, and the script that registers it to Unity Catalog.
+- `endpoint_config.json` - the serving-endpoint config (scale-to-zero, smallest size). See the hazard note under Deploy.
+- `databricks_notebook.py` - an alternative walkthrough for a standard (paid) workspace. It does **not** work on Free Edition - read its header first.
+- `requirements.txt` - `mlflow` (2.x), `pandas`.
 
-## Deploy (Databricks CLI + MLflow)
+## Run it locally (no Databricks, any operating system)
 
-Prereqs: Databricks CLI authenticated (`databricks auth login --host <host> --profile <profile>`), and `pip install -r requirements.txt`.
+Just to confirm the model works. No account, no cloud, no Linux required:
 
 ```bash
-# 1. Register the model to Unity Catalog (edit UC_CATALOG/UC_SCHEMA if needed)
-DATABRICKS_CONFIG_PROFILE=<profile> UC_CATALOG=workspace UC_SCHEMA=default python register_model.py
-
-# 2. Create the scale-to-zero serving endpoint from the registered model
-databricks serving-endpoints create --json @endpoint_config.json --profile <profile>
-
-# 3. Wait until it is READY
-databricks serving-endpoints get coldstart-echo-fortune --profile <profile>
+pip install -r requirements.txt
+python -c "import pandas as pd; from register_byvalue import EchoFortuneModel; print(EchoFortuneModel().predict(None, pd.DataFrame([{'prompt':'hello'}])))"
 ```
 
-If `entity_version` in `endpoint_config.json` does not match (first registration is version 1), update it to the version `register_model.py` printed.
+You should see something like `[{'echo': 'hello', 'fortune': '...'}]`. That proves the model is fine. You cannot reproduce a cold start locally, though - your own machine never scales to zero. For that you need the endpoint below.
+
+## Deploy to Databricks (the scale-to-zero endpoint)
+
+This is a **minimal happy path in three phases, then a wait**, not a one-liner. The full runbook - how to get the auth token, and the gotchas that bit us - is in [DEPLOYMENT.md](DEPLOYMENT.md). The short shape:
+
+1. **Register** the model to Unity Catalog: run `register_byvalue.py` (from any machine with the Databricks CLI authenticated - any OS).
+2. **Create** the endpoint: `databricks serving-endpoints create --json @endpoint_config.json`.
+3. **Wait ~10 minutes**, poll until it reports `READY`, then query it.
+
+> HAZARD: `endpoint_config.json` pins `entity_version` (currently `11`). After you register, change it to the version number your registration step printed - otherwise you deploy an old or wrong model version.
 
 ## Measure a cold start
 
 ```bash
-# Warm call - time it
+# Warm call - time it:
 time databricks serving-endpoints query coldstart-echo-fortune \
   --json '{"dataframe_records":[{"prompt":"hello"}]}' --profile <profile>
 
-# Let it scale to zero (idle a while - minutes), then call again and time it.
-# The difference between the cold call and the warm call is your cold-start cost.
+# Let it sit idle a while (minutes) so it scales to zero, then call again and time it.
+# cold latency - warm latency = your cold-start cost.
 ```
 
-Record: warm latency, cold latency, and whether the first cold hit returns a fast 429 ("starting"), a slow 200, or a timeout. That surface is what the facade classifies as "warming / please hold."
+Note whether the first cold hit comes back as a fast `429` ("starting"), a slow `200`, or a timeout - that surface is what the `genai-coldstart-guard` facade classifies as "warming / please hold."
 
-## Cost control
+## Cost
 
-Scale-to-zero means it costs nothing while idle (that is the point). When you are done, delete it:
+Scale-to-zero means it costs nothing while idle - that is the point. When you are finished, delete it:
 
 ```bash
 databricks serving-endpoints delete coldstart-echo-fortune --profile <profile>
 ```
-
-## Notes / gotchas
-
-- `mlflow.pyfunc.log_model` uses `artifact_path=` on MLflow 2.x; on MLflow 3.x that argument is renamed `name=`. Adjust `register_model.py` if you are on 3.x.
-- Registration needs a Unity Catalog schema you can write to; `workspace.default` is the Free Edition default. In the office, use a catalog/schema you own.
-- Whether **custom** model serving is available depends on the workspace tier. Foundation Model endpoints are always present; custom pyfunc serving may be gated on some tiers.
