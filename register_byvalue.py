@@ -20,8 +20,10 @@ See DEPLOYMENT.md for how to get the token and why these env vars are needed.
 
 from __future__ import annotations
 
+import logging
 import os
 import random
+import time
 
 import mlflow.pyfunc
 import pandas as pd
@@ -45,17 +47,53 @@ class EchoFortuneModel(mlflow.pyfunc.PythonModel):
         "The wound is the place where the light enters you. - Rumi",
     ]
 
+    def load_context(self, context):
+        # The serving container captures the ROOT logger (note the "WARNING:root:" lines
+        # in the endpoint Logs), so route timing through root and lower its level enough
+        # for DEBUG to emit. Gate with LOG_LEVEL; default DEBUG here so the demo shows.
+        import sys
+
+        level = getattr(logging, os.environ.get("LOG_LEVEL", "DEBUG").upper(), logging.DEBUG)
+        root = logging.getLogger()
+        root.setLevel(level)
+        if not root.handlers:
+            handler = logging.StreamHandler(sys.stdout)
+            handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+            root.addHandler(handler)
+        for handler in root.handlers:
+            handler.setLevel(level)
+        logging.getLogger("echo").setLevel(level)  # propagates to root (default)
+
     def predict(self, context, model_input, params=None):
+        # INSTRUMENTATION PATTERN - copy this style into the real service, in front of the
+        # SQL reads, the connection setup, and each LLM call. The echo does almost nothing,
+        # so these numbers are tiny; the point is the STYLE, not the values. In an importable
+        # module you would use the @timed_call decorator from timing.py instead of inline
+        # blocks (the echo is pickled by value, so it stays self-contained here).
+        log = logging.getLogger("echo")
+        spans = {}
+
+        t = time.perf_counter()
         if isinstance(model_input, pd.DataFrame):
             rows = model_input.to_dict(orient="records")
         elif isinstance(model_input, dict):
             rows = [model_input]
         else:
             rows = model_input
+        spans["parse_input"] = (time.perf_counter() - t) * 1000.0
+
+        t = time.perf_counter()
         out = []
         for r in rows:
             echo = (r.get("prompt") or r.get("query") or str(r)) if isinstance(r, dict) else str(r)
             out.append({"echo": echo, "fortune": random.choice(self.FORTUNES)})
+        spans["build_answer"] = (time.perf_counter() - t) * 1000.0
+
+        total = sum(spans.values()) or 1.0
+        log.debug(
+            "[TIMING] total=%.3fms | " + " ".join(f"{k}=%.3fms(%.0f%%)" for k in spans),
+            total, *[x for k in spans for x in (spans[k], 100 * spans[k] / total)],
+        )
         return out
 
 
