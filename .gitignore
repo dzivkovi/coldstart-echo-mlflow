@@ -8,3 +8,8 @@ mlruns/
 .env
 .DS_Store
 .databricks/
+
+# local mlflow test state
+mlflow.db
+*.db
+mlruns/
