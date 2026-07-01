@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+mlruns/
+.mlflow/
+*.egg-info/
+.env
+.DS_Store
+.databricks/
