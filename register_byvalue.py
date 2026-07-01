@@ -89,15 +89,18 @@ class EchoFortuneModel(mlflow.pyfunc.PythonModel):
         #
         # LOG BY EXCEPTION: a healthy warm request logs NOTHING at any level. We only emit a line
         # when the request is interesting - (a) the cold-first request this worker serves, (b) an
-        # error, or (c) slower than SLOW_REQUEST_LOG_THRESHOLD_SECONDS - and only then dump the breakdown
-        # (you care where the time went precisely when it was slow). The spans are always COMPUTED
-        # so the breakdown is ready if a branch needs it; they are just not logged on the warm path.
+        # error, or (c) slower than SLOW_REQUEST_LOG_THRESHOLD_SECONDS - and only then build and dump
+        # the breakdown. The warm-success path does no logging work at all, not even formatting the
+        # breakdown string (spans are still measured; they are just never turned into a line).
         log = logging.getLogger("echo")
 
         started = time.perf_counter()
-        # Consume the cold-first marker BEFORE doing the work, so a failure on the first request
-        # still counts as cold-first (the next request is warm, not a second "cold" line).
-        is_first = not self._saw_first_request
+        # Consume the cold-first marker BEFORE doing the work, so a failure on the first request still
+        # counts as cold-first (the next request is warm, not a second "cold" line). BEST-EFFORT per
+        # worker, not exact-once: no lock (a Lock is not picklable under by-value logging), so if two
+        # requests race this very first check you may get two [COLDSTART] lines - fine for a marker.
+        # getattr guards the (unexpected) case of predict() running before load_context().
+        is_first = not getattr(self, "_saw_first_request", False)
         if is_first:
             self._saw_first_request = True
 
@@ -126,29 +129,33 @@ class EchoFortuneModel(mlflow.pyfunc.PythonModel):
             raise
         finally:
             latency_ms = (time.perf_counter() - started) * 1000.0
-            # Phase breakdown - built once, appended only to the branches that log.
-            total = sum(spans.values()) or 1.0
-            breakdown = " ".join(
-                f"{k}={spans[k]:.3f}ms({100 * spans[k] / total:.0f}%)" for k in spans
-            )
-            if is_first:
-                # The cold-first line, folding in what the old worker_boot line carried. LATENCY is
-                # the cold signal (not seconds_since_boot); the true caller-felt wait is measured
-                # OUTSIDE at the facade, here we only MARK the cold-first for correlation.
-                log.warning(
-                    "[COLDSTART] first request after boot: pid=%d latency_ms=%.1f status=%s | %s",
-                    os.getpid(), latency_ms, "error" if error else "ok", breakdown,
+            threshold_ms = self.SLOW_REQUEST_LOG_THRESHOLD_SECONDS * 1000.0
+            should_log = is_first or error is not None or latency_ms >= threshold_ms
+            if should_log:
+                # Build the phase breakdown ONLY when a branch below will log it - the warm-success
+                # path never reaches here, so it pays nothing for formatting it does not use.
+                total = sum(spans.values()) or 1.0
+                breakdown = " ".join(
+                    f"{k}={spans[k]:.3f}ms({100 * spans[k] / total:.0f}%)" for k in spans
                 )
-            elif error is not None:
-                log.warning(
-                    "[REQUEST] error latency_ms=%.1f error_type=%s | %s",
-                    latency_ms, type(error).__name__, breakdown,
-                )
-            elif latency_ms >= self.SLOW_REQUEST_LOG_THRESHOLD_SECONDS * 1000.0:
-                log.warning(
-                    "[REQUEST] slow latency_ms=%.1f threshold_ms=%.1f | %s",
-                    latency_ms, self.SLOW_REQUEST_LOG_THRESHOLD_SECONDS * 1000.0, breakdown,
-                )
+                if is_first:
+                    # The cold-first line, folding in what the old worker_boot line carried. LATENCY is
+                    # the cold signal (not seconds_since_boot); the true caller-felt wait is measured
+                    # OUTSIDE at the facade, here we only MARK the cold-first for correlation.
+                    log.warning(
+                        "[COLDSTART] first request after boot: pid=%d latency_ms=%.1f status=%s | %s",
+                        os.getpid(), latency_ms, "error" if error else "ok", breakdown,
+                    )
+                elif error is not None:
+                    log.warning(
+                        "[REQUEST] error latency_ms=%.1f error_type=%s | %s",
+                        latency_ms, type(error).__name__, breakdown,
+                    )
+                else:
+                    log.warning(
+                        "[REQUEST] slow latency_ms=%.1f threshold_ms=%.1f | %s",
+                        latency_ms, threshold_ms, breakdown,
+                    )
 
 
 def _register() -> None:
