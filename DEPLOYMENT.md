@@ -42,19 +42,19 @@ done
 3. MLflow 3.x renamed the arg. `mlflow.pyfunc.log_model(artifact_path=...)` became `name=...` in MLflow 3.x. `register_model.py` uses `name="model"`. On MLflow 2.x, change it back to `artifact_path="model"`.
 4. Log the model FROM CODE, not as an instance. Passing a class instance (`python_model=EchoFortuneModel()`) pickles the class by reference; the serving container then cannot `import model` and fails at load with "Model server failed to load the model" (endpoint reaches UPDATE_FAILED after the build). Fix (MLflow's blessed pattern, and how the office model is packaged): end `model.py` with `mlflow.models.set_model(EchoFortuneModel())`, and log with `python_model="model.py"` (the PATH). This is exactly what broke v1 and fixed v2 here.
 
-## KNOWN ISSUE: logging from Windows / Python 3.12 fails to serve (fix: log from Linux/Databricks)
+## WHAT ACTUALLY WORKED (use register_byvalue.py)
 
-Observed 2026-07-01 on AWS Free Edition: four deploy attempts all reached `UPDATE_FAILED` with `"Model server failed to load the model."` The model is PROVEN CORRECT - it logs, loads, and predicts locally, and loads from Unity Catalog (`mlflow.pyfunc.load_model("models:/...")` returns the echo+fortune). The failure is the LOGGING ENVIRONMENT, not the model:
+Resolved 2026-07-01 on AWS Free Edition after several failed attempts. The winning recipe:
 
-- The `MLmodel` recorded `model_code_path: C:\Users\...\model.py` - an ABSOLUTE WINDOWS path. The Linux serving container cannot resolve `C:\...`, so models-from-code fails to load there.
-- It also recorded `python_version: 3.12.10`; Databricks Model Serving may not support 3.12 on this tier.
+- Register from the LAPTOP (not serverless), as a BY-VALUE instance: use `register_byvalue.py`, which defines the model class in `__main__` and logs the INSTANCE. cloudpickle serializes the class by value into `python_model.pkl`, so there is NO `model_code_path` at all - which is what broke every other attempt. Then create the endpoint from `endpoint_config.json`. It built to READY and serves; Python 3.12 turned out to be fine.
+- Verified: `serving-endpoints query ... {"dataframe_records":[{"prompt":"hi"}]}` returns `{"predictions":[{"echo":"hi","fortune":"..."}]}`, and the facade app (BACKEND_MODE=databricks) returns the answer end-to-end.
 
-Neither is fixable from a Windows + Python 3.12 laptop. The fix at the office (or any real workspace):
+### Two dead ends we ruled out (so you do not repeat them)
 
-- LOG THE MODEL FROM A LINUX ENVIRONMENT with a supported Python (3.11): run `register_model.py` from a Databricks notebook / job, or Databricks Connect, or a Linux CI runner with a Python 3.11 venv. Then `model_code_path` is relative and the Python version is supported, and the endpoint builds. The model code and `register_model.py` here are correct as-is; only the logging host needs to change.
-- Quickest path: paste `model.py` + the `register_model.py` body into a Databricks notebook cell and run it there (Linux, supported Python, relative paths) - then create the endpoint from `endpoint_config.json`.
+1. models-from-code / class-instance-by-reference from Windows: the `MLmodel` recorded `model_code_path: C:\Users\...\model.py` (an absolute Windows path the Linux serving container cannot resolve) -> `UPDATE_FAILED`, "Model server failed to load the model." By-value logging (register_byvalue.py) removes the code path entirely and fixes this. It was the Windows PATH, not the Python version.
+2. Running the notebook on Free Edition serverless (job OR interactive): the serverless compute role is EXPLICITLY DENIED writing model artifacts to UC storage (`s3:PutObject ... AccessDenied ... explicit deny`). So you cannot register a custom model from Free Edition serverless at all - the laptop (your own identity) is the only thing that can write it. At the office (a real workspace) either path works; on Free Edition, use the laptop + register_byvalue.py.
 
-The facade wiring was still verified end-to-end against this failed endpoint: the app (BACKEND_MODE=databricks) called the real management API, classified `NOT_READY`/`UPDATE_FAILED`, and returned a graceful "being updated, try again shortly" (503) instead of crashing - which is exactly the honest-classification behavior the whole project is about.
+The facade was verified against BOTH states: while the endpoint was UPDATE_FAILED it returned a graceful "being updated, try again shortly" (503); once READY it returns the echo+fortune answer (200). That is the honest-classification behavior the whole project is about.
 
 ## Where it lives in the console (three different places)
 

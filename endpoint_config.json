@@ -4,7 +4,7 @@
     "served_entities": [
       {
         "entity_name": "workspace.default.coldstart_echo_fortune",
-        "entity_version": "4",
+        "entity_version": "11",
         "workload_size": "Small",
         "scale_to_zero_enabled": true
       }
