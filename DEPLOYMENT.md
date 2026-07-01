@@ -85,6 +85,19 @@ A code-only change may cut over in seconds (cached container); a dependency chan
 - The serving endpoint: **Serving -> coldstart-echo-fortune** (watch it build; the URL is here).
 - The run/experiment: **Experiments -> /Users/<you>/coldstart-echo-fortune**.
 
+## Reading the endpoint logs (where [TIMING] / [COLDSTART] show up)
+
+Easiest: the **Logs** tab on the Serving page (Serving -> coldstart-echo-fortune -> Logs). Or the CLI:
+
+```bash
+# the served-model name is <model>_name-<version>, e.g. coldstart_echo_fortune-15;
+# read it from the endpoint's served_entities[].name:
+SM=$(databricks serving-endpoints get coldstart-echo-fortune -p <profile> | grep -oE 'coldstart_echo_fortune-[0-9]+' | head -1)
+databricks serving-endpoints logs coldstart-echo-fortune "$SM" -p <profile> | grep -E 'TIMING|COLDSTART'
+```
+
+Remember: `[COLDSTART] worker_boot` is WARNING so it always shows; the per-request `[TIMING]` and `[COLDSTART] request` lines are DEBUG, so they only appear when `LOG_LEVEL=DEBUG` is set as an endpoint environment variable (which is a config change - it redeploys).
+
 ## Cost
 
 Scale-to-zero costs nothing while idle. Delete when finished:
