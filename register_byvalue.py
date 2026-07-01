@@ -30,6 +30,14 @@ import pandas as pd
 
 
 class EchoFortuneModel(mlflow.pyfunc.PythonModel):
+    # LOG-ONLY threshold: a request slower than this gets ONE warning line after it
+    # finishes. It NEVER terminates, times out, or interrupts the request - the caller
+    # always gets the full response; this only decides whether the call was worth logging.
+    # 8s reflects the old web "8-second rule" (max-tolerable time-to-first-byte). The echo
+    # is sub-millisecond so this never trips in practice; it is here as the copy-into-the-
+    # real-service pattern (wrap the SQL reads / LLM calls and this surfaces the slow ones).
+    SLOW_REQUEST_LOG_THRESHOLD_SECONDS = 8.0
+
     # Provenance is deliberately clean for corporate / open-source review: every
     # line is either original to this repo or a short PUBLIC-DOMAIN (pre-1929)
     # quotation. This is intentionally NOT the Unix `fortunes` database, whose
@@ -64,13 +72,13 @@ class EchoFortuneModel(mlflow.pyfunc.PythonModel):
             handler.setLevel(level)
         logging.getLogger("echo").setLevel(level)  # propagates to root (default)
 
-        # COLD-START MARKER. load_context runs ONCE per worker process boot, so this line marks
-        # a worker that just cold-started - per WORKER, not per replica (Databricks runs several
-        # gunicorn workers, each loads the model). Databricks gives no built-in cold-start signal,
-        # so we print our own. WARNING so it is always visible; monotonic clock for elapsed time.
-        self._boot_monotonic = time.monotonic()
-        self._request_count = 0
-        logging.getLogger("echo").warning("[COLDSTART] worker_boot pid=%d", os.getpid())
+        # COLD-START MARKER. load_context runs ONCE per worker process boot. We do NOT log a
+        # worker_boot line here - a boot with no traffic is not interesting, and from inside the
+        # model "seconds since boot" is a poor cold-start proxy anyway. Instead predict() logs the
+        # FIRST request this worker serves, tagged with that request's LATENCY (the thing that
+        # actually hurt). Plain boolean (no lock): a Lock is not picklable and MLflow logs the
+        # model by value, so a lock would break serialization.
+        self._saw_first_request = False
 
     def predict(self, context, model_input, params=None):
         # INSTRUMENTATION PATTERN - copy this style into the real service, in front of the
@@ -78,43 +86,69 @@ class EchoFortuneModel(mlflow.pyfunc.PythonModel):
         # so these numbers are tiny; the point is the STYLE, not the values. In an importable
         # module you would use the @timed_call decorator from timing.py instead of inline
         # blocks (the echo is pickled by value, so it stays self-contained here).
+        #
+        # LOG BY EXCEPTION: a healthy warm request logs NOTHING at any level. We only emit a line
+        # when the request is interesting - (a) the cold-first request this worker serves, (b) an
+        # error, or (c) slower than SLOW_REQUEST_LOG_THRESHOLD_SECONDS - and only then dump the breakdown
+        # (you care where the time went precisely when it was slow). The spans are always COMPUTED
+        # so the breakdown is ready if a branch needs it; they are just not logged on the warm path.
         log = logging.getLogger("echo")
 
-        # Flag the first request THIS worker serves after boot - that is the cold-started one.
-        # Plain counter (no lock): a Lock is not picklable and MLflow logs the model by value;
-        # the only cost is a negligible race on the exact-simultaneous first request.
-        self._request_count += 1
-        request_number = self._request_count
-        cold_first = request_number == 1
-        log.debug(
-            "[COLDSTART] request pid=%d request_number=%d cold_first_request=%s seconds_since_boot=%.3f",
-            os.getpid(), request_number, cold_first, time.monotonic() - self._boot_monotonic,
-        )
+        started = time.perf_counter()
+        # Consume the cold-first marker BEFORE doing the work, so a failure on the first request
+        # still counts as cold-first (the next request is warm, not a second "cold" line).
+        is_first = not self._saw_first_request
+        if is_first:
+            self._saw_first_request = True
 
         spans = {}
+        error = None
+        try:
+            t = time.perf_counter()
+            if isinstance(model_input, pd.DataFrame):
+                rows = model_input.to_dict(orient="records")
+            elif isinstance(model_input, dict):
+                rows = [model_input]
+            else:
+                rows = model_input
+            spans["parse_input"] = (time.perf_counter() - t) * 1000.0
 
-        t = time.perf_counter()
-        if isinstance(model_input, pd.DataFrame):
-            rows = model_input.to_dict(orient="records")
-        elif isinstance(model_input, dict):
-            rows = [model_input]
-        else:
-            rows = model_input
-        spans["parse_input"] = (time.perf_counter() - t) * 1000.0
+            t = time.perf_counter()
+            out = []
+            for r in rows:
+                echo = (r.get("prompt") or r.get("query") or str(r)) if isinstance(r, dict) else str(r)
+                out.append({"echo": echo, "fortune": random.choice(self.FORTUNES)})
+            spans["build_answer"] = (time.perf_counter() - t) * 1000.0
 
-        t = time.perf_counter()
-        out = []
-        for r in rows:
-            echo = (r.get("prompt") or r.get("query") or str(r)) if isinstance(r, dict) else str(r)
-            out.append({"echo": echo, "fortune": random.choice(self.FORTUNES)})
-        spans["build_answer"] = (time.perf_counter() - t) * 1000.0
-
-        total = sum(spans.values()) or 1.0
-        log.debug(
-            "[TIMING] total=%.3fms | " + " ".join(f"{k}=%.3fms(%.0f%%)" for k in spans),
-            total, *[x for k in spans for x in (spans[k], 100 * spans[k] / total)],
-        )
-        return out
+            return out
+        except Exception as exc:
+            error = exc
+            raise
+        finally:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            # Phase breakdown - built once, appended only to the branches that log.
+            total = sum(spans.values()) or 1.0
+            breakdown = " ".join(
+                f"{k}={spans[k]:.3f}ms({100 * spans[k] / total:.0f}%)" for k in spans
+            )
+            if is_first:
+                # The cold-first line, folding in what the old worker_boot line carried. LATENCY is
+                # the cold signal (not seconds_since_boot); the true caller-felt wait is measured
+                # OUTSIDE at the facade, here we only MARK the cold-first for correlation.
+                log.warning(
+                    "[COLDSTART] first request after boot: pid=%d latency_ms=%.1f status=%s | %s",
+                    os.getpid(), latency_ms, "error" if error else "ok", breakdown,
+                )
+            elif error is not None:
+                log.warning(
+                    "[REQUEST] error latency_ms=%.1f error_type=%s | %s",
+                    latency_ms, type(error).__name__, breakdown,
+                )
+            elif latency_ms >= self.SLOW_REQUEST_LOG_THRESHOLD_SECONDS * 1000.0:
+                log.warning(
+                    "[REQUEST] slow latency_ms=%.1f threshold_ms=%.1f | %s",
+                    latency_ms, self.SLOW_REQUEST_LOG_THRESHOLD_SECONDS * 1000.0, breakdown,
+                )
 
 
 def _register() -> None:
