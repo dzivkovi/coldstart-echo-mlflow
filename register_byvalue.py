@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import threading
 import time
 
 import mlflow.pyfunc
@@ -64,6 +65,15 @@ class EchoFortuneModel(mlflow.pyfunc.PythonModel):
             handler.setLevel(level)
         logging.getLogger("echo").setLevel(level)  # propagates to root (default)
 
+        # COLD-START MARKER. load_context runs ONCE per worker process boot, so this line marks
+        # a worker that just cold-started - per WORKER, not per replica (Databricks runs several
+        # gunicorn workers, each loads the model). Databricks gives no built-in cold-start signal,
+        # so we print our own. WARNING so it is always visible; monotonic clock for elapsed time.
+        self._boot_monotonic = time.monotonic()
+        self._request_count = 0
+        self._request_lock = threading.Lock()
+        logging.getLogger("echo").warning("[COLDSTART] worker_boot pid=%d", os.getpid())
+
     def predict(self, context, model_input, params=None):
         # INSTRUMENTATION PATTERN - copy this style into the real service, in front of the
         # SQL reads, the connection setup, and each LLM call. The echo does almost nothing,
@@ -71,6 +81,17 @@ class EchoFortuneModel(mlflow.pyfunc.PythonModel):
         # module you would use the @timed_call decorator from timing.py instead of inline
         # blocks (the echo is pickled by value, so it stays self-contained here).
         log = logging.getLogger("echo")
+
+        # Flag the first request THIS worker serves after boot - that is the cold-started one.
+        with self._request_lock:
+            self._request_count += 1
+            request_number = self._request_count
+        cold_first = request_number == 1
+        log.debug(
+            "[COLDSTART] request pid=%d request_number=%d cold_first_request=%s seconds_since_boot=%.3f",
+            os.getpid(), request_number, cold_first, time.monotonic() - self._boot_monotonic,
+        )
+
         spans = {}
 
         t = time.perf_counter()
