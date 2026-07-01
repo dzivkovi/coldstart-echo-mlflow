@@ -32,9 +32,8 @@ input_example = pd.DataFrame([{"prompt": "hello from the cold-start harness"}])
 
 with mlflow.start_run(run_name="coldstart-echo-fortune"):
     info = mlflow.pyfunc.log_model(
-        name="model",  # MLflow 3.x; on 2.x use artifact_path="model"
+        artifact_path="model",  # MLflow 2.x; on 3.x use name="model"
         python_model="model.py",  # models-from-code: a PATH, not an instance
-        artifacts={"fortunes": "fortunes.txt"},
         input_example=input_example,
         pip_requirements=["mlflow", "pandas"],
         registered_model_name=REGISTERED,

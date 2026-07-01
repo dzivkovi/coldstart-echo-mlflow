@@ -1,40 +1,54 @@
-"""Minimal scale-to-zero cold-start harness (MLflow pyfunc).
+"""Minimal scale-to-zero cold-start harness (MLflow pyfunc), self-contained.
 
-Echoes the request text and appends a random offline fortune. No model weights,
-no network, no dependencies beyond mlflow/pandas - so the ONLY latency it adds
-over a warm call is the platform cold start (waking a replica from zero).
+Echoes the request text and appends a random offline fortune. No artifacts, no
+network, no file reads at load time - fortunes are embedded inline so the serving
+container has nothing external to resolve. The only latency it adds over a warm
+call is the platform cold start (waking a replica), which is what we measure.
 
-Deploy it as a Databricks Model Serving endpoint with scale_to_zero_enabled=true
-to reproduce and MEASURE the cold start that any scale-to-zero pyfunc shows -
-including the office dispatcher. The delay is the replica waking, not what's
-inside, which is the whole point: a six-line echo cold-starts the same as a
-heavy app.
+Logged via MLflow "models from code" (set_model at the bottom) so the serving
+container loads THIS file as the model definition.
 """
 
 from __future__ import annotations
 
 import random
-from pathlib import Path
+from typing import Any
 
+import mlflow.models
 import mlflow.pyfunc
 import pandas as pd
 
+# Provenance is deliberately clean for corporate / OSS review: original lines plus
+# short PUBLIC-DOMAIN (pre-1929) quotations. NOT the Unix fortunes database.
+FORTUNES = [
+    "Simplicity is the ultimate sophistication.",
+    "A slow system that tells the truth beats a fast one that lies.",
+    "Make it work, make it right, make it fast - in that order.",
+    "The cheapest, fastest, most reliable component is the one that is not there.",
+    "Cold starts are honest: the wait is the replica waking, not the model thinking.",
+    "Name the real problem and half of it is solved.",
+    "When in doubt, instrument before you assert.",
+    "A good API tells you what happened, not just that something did.",
+    "Patience is warm; scale-to-zero is cheap. Choose per environment.",
+    "Under-promise in the standup; over-deliver with the numbers.",
+    "Concede the precise fact and you keep the larger point.",
+    "You have power over your mind, not outside events. - Marcus Aurelius",
+    "The impediment to action advances action. What stands in the way becomes the way. - Marcus Aurelius",
+    "A journey of a thousand miles begins with a single step. - Lao Tzu",
+    "Nature does not hurry, yet everything is accomplished. - Lao Tzu",
+    "We suffer more often in imagination than in reality. - Seneca",
+    "Luck is what happens when preparation meets opportunity. - Seneca",
+    "It does not matter how slowly you go as long as you do not stop. - Confucius",
+    "It is not what happens to you, but how you react to it that matters. - Epictetus",
+    "We are what we repeatedly do. Excellence, then, is a habit. - Aristotle",
+    "No man ever steps in the same river twice. - Heraclitus",
+    "The wound is the place where the light enters you. - Rumi",
+    "He who has a why to live can bear almost any how. - Friedrich Nietzsche",
+]
+
 
 class EchoFortuneModel(mlflow.pyfunc.PythonModel):
-    def load_context(self, context):
-        text = Path(context.artifacts["fortunes"]).read_text(encoding="utf-8")
-        self._fortunes = [
-            line.strip()
-            for line in text.splitlines()
-            if line.strip() and not line.startswith("#")
-        ]
-
-    def _fortune(self) -> str:
-        return random.choice(self._fortunes) if self._fortunes else ""
-
     def predict(self, context, model_input, params=None):
-        # Model Serving hands us a DataFrame (from dataframe_records/split);
-        # be tolerant of dict/list too so it is easy to call by hand.
         if isinstance(model_input, pd.DataFrame):
             rows = model_input.to_dict(orient="records")
         elif isinstance(model_input, dict):
@@ -50,13 +64,8 @@ class EchoFortuneModel(mlflow.pyfunc.PythonModel):
                 echo = row.get("prompt") or row.get("text") or row.get("query") or str(row)
             else:
                 echo = str(row)
-            out.append({"echo": echo, "fortune": self._fortune()})
+            out.append({"echo": echo, "fortune": random.choice(FORTUNES)})
         return out
 
-
-# MLflow "models from code": the serving container loads THIS file as the model
-# definition, so the class is always importable. Logging a class INSTANCE instead
-# pickles it by reference and fails at serving with "failed to load the model".
-import mlflow.models  # noqa: E402
 
 mlflow.models.set_model(EchoFortuneModel())
