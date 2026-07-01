@@ -23,7 +23,6 @@ from __future__ import annotations
 import logging
 import os
 import random
-import threading
 import time
 
 import mlflow.pyfunc
@@ -71,7 +70,6 @@ class EchoFortuneModel(mlflow.pyfunc.PythonModel):
         # so we print our own. WARNING so it is always visible; monotonic clock for elapsed time.
         self._boot_monotonic = time.monotonic()
         self._request_count = 0
-        self._request_lock = threading.Lock()
         logging.getLogger("echo").warning("[COLDSTART] worker_boot pid=%d", os.getpid())
 
     def predict(self, context, model_input, params=None):
@@ -83,9 +81,10 @@ class EchoFortuneModel(mlflow.pyfunc.PythonModel):
         log = logging.getLogger("echo")
 
         # Flag the first request THIS worker serves after boot - that is the cold-started one.
-        with self._request_lock:
-            self._request_count += 1
-            request_number = self._request_count
+        # Plain counter (no lock): a Lock is not picklable and MLflow logs the model by value;
+        # the only cost is a negligible race on the exact-simultaneous first request.
+        self._request_count += 1
+        request_number = self._request_count
         cold_first = request_number == 1
         log.debug(
             "[COLDSTART] request pid=%d request_number=%d cold_first_request=%s seconds_since_boot=%.3f",

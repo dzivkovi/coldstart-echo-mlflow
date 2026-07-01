@@ -56,6 +56,29 @@ done
 # -> {"predictions":[{"echo":"hi","fortune":"..."}]}
 ```
 
+## Redeploy a new version (after you edit the model)
+
+Do NOT delete and recreate the endpoint. Register a new version and **swap** the endpoint to it with `update-config`: the endpoint keeps its name and URL, stays live on the old version until the new one is READY (no downtime), and keeps scale-to-zero.
+
+```bash
+# 1. register the new version
+python register_byvalue.py            # prints "Registered ... version <N>"
+
+# 2. read the newest version number and point the endpoint at it
+V=$(databricks model-versions list workspace.default.coldstart_echo_fortune -p <profile> \
+     | grep -oE '"version": *[0-9]+' | grep -oE '[0-9]+' | sort -n | tail -1)
+databricks serving-endpoints update-config coldstart-echo-fortune -p <profile> --json \
+  "{\"served_entities\":[{\"entity_name\":\"workspace.default.coldstart_echo_fortune\",\"entity_version\":\"$V\",\"workload_size\":\"Small\",\"scale_to_zero_enabled\":true}]}"
+
+# 3. wait until READY, then query
+until databricks serving-endpoints get coldstart-echo-fortune -p <profile> | grep -q '"ready": "READY"'; do
+  echo building...; sleep 20
+done
+databricks serving-endpoints query coldstart-echo-fortune --json '{"dataframe_records":[{"prompt":"hello"}]}' -p <profile>
+```
+
+A code-only change may cut over in seconds (cached container); a dependency change is a full ~10-min rebuild. Changing an endpoint environment variable (e.g. `LOG_LEVEL=DEBUG`) is also a config change and redeploys the same way. Keep `entity_version` in `endpoint_config.json` in sync with `<N>` (or just use the `update-config` command above, which takes it inline).
+
 ## Where it lives in the console (three separate places)
 
 - The model: **Catalog -> workspace -> default -> Models -> coldstart_echo_fortune** (Unity Catalog, not your user folder).
