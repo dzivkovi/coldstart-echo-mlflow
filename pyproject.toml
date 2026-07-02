@@ -1,0 +1,14 @@
+# Lint config for the coldstart-echo-mlflow sample. Roomier 120-char lines so the teaching
+# comments do not have to wrap. target-version py39 mirrors the code this sample is copied into.
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+# databricks_notebook.py is a notebook-cell layout (imports live in their cell, not at the
+# top of the file), so E402 "import not at top" is expected there, not a defect.
+[tool.ruff.lint.per-file-ignores]
+"databricks_notebook.py" = ["E402"]
+
+[tool.pylint.format]
+max-line-length = 120
