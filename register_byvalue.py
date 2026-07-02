@@ -33,10 +33,23 @@ class EchoFortuneModel(mlflow.pyfunc.PythonModel):
     # LOG-ONLY threshold: a request slower than this gets ONE warning line after it
     # finishes. It NEVER terminates, times out, or interrupts the request - the caller
     # always gets the full response; this only decides whether the call was worth logging.
-    # 8s reflects the old web "8-second rule" (max-tolerable time-to-first-byte). The echo
-    # is sub-millisecond so this never trips in practice; it is here as the copy-into-the-
-    # real-service pattern (wrap the SQL reads / LLM calls and this surfaces the slow ones).
+    # 8s reflects the old web "8-second rule" (max-tolerable time-to-first-byte). The echo's own
+    # work is sub-millisecond, so without the demo slow-sim below this would never trip; it is here
+    # as the copy-into-the-real-service pattern (wrap the SQL reads / LLM calls and this surfaces
+    # the slow ones).
     SLOW_REQUEST_LOG_THRESHOLD_SECONDS = 8.0
+
+    # DEMO pipeline simulation: stand-ins for the utilities a real predict() calls before it can
+    # answer - a connection/pool setup, a couple of point reads, a retrieval step. Each has a tiny
+    # baseline cost AND can independently SPIKE (a slow warehouse read, a cold connection pool, a
+    # slow downstream call), which is what trips "[REQUEST] slow". Each contributes its OWN timing
+    # span, so the breakdown shows WHICH utility was slow - the whole point of instrumentation.
+    # Generic names on purpose; a real service measures its own steps and never injects latency -
+    # delete this simulation when you copy the pattern. Set STEP_SPIKE_PROBABILITY = 0.0 to disable.
+    SIMULATED_STEPS = ("connection_setup", "reference_lookup", "history_fetch", "retrieval")
+    STEP_BASELINE_SECONDS = (0.003, 0.02)   # per-step baseline latency (3-20ms): realistic and tiny
+    STEP_SPIKE_PROBABILITY = 0.10           # each step spikes independently; ~1 in 3 requests slow
+    STEP_SPIKE_SECONDS = 9.0                # a spike sleeps past SLOW_REQUEST_LOG_THRESHOLD_SECONDS
 
     # Provenance is deliberately clean for corporate / open-source review: every
     # line is either original to this repo or a short PUBLIC-DOMAIN (pre-1929)
@@ -58,7 +71,13 @@ class EchoFortuneModel(mlflow.pyfunc.PythonModel):
     def load_context(self, context):
         # The serving container captures the ROOT logger (note the "WARNING:root:" lines
         # in the endpoint Logs), so route timing through root and lower its level enough
-        # for DEBUG to emit. Gate with LOG_LEVEL; default DEBUG here so the demo shows.
+        # for DEBUG to emit. Gate with LOG_LEVEL.
+        #
+        # TODO (before reusing this in a real service): this DEMO defaults to DEBUG on purpose, so
+        # the per-request [TIMING] lines appear with zero setup - otherwise people set nothing, see
+        # no logs, and go hunting in Splunk. For a real deployment set LOG_LEVEL explicitly (INFO is
+        # the usual choice): at INFO the per-request timing goes quiet and only the WARNING-level
+        # cold-start / slow / error lines remain.
         import sys
 
         level = getattr(logging, os.environ.get("LOG_LEVEL", "DEBUG").upper(), logging.DEBUG)
@@ -87,11 +106,13 @@ class EchoFortuneModel(mlflow.pyfunc.PythonModel):
         # module you would use the @timed_call decorator from timing.py instead of inline
         # blocks (the echo is pickled by value, so it stays self-contained here).
         #
-        # LOG BY EXCEPTION: a healthy warm request logs NOTHING at any level. We only emit a line
-        # when the request is interesting - (a) the cold-first request this worker serves, (b) an
-        # error, or (c) slower than SLOW_REQUEST_LOG_THRESHOLD_SECONDS - and only then build and dump
-        # the breakdown. The warm-success path does no logging work at all, not even formatting the
-        # breakdown string (spans are still measured; they are just never turned into a line).
+        # TWO-TIER LOGGING (this is the shape to copy into the real service):
+        #   - DEBUG: EVERY request logs one [TIMING] line - the per-step breakdown. This is the
+        #     instrumentation recipe to reuse: measure each step, report its share of the total.
+        #   - WARNING (still shows when DEBUG is off, e.g. production at INFO): the cold-first
+        #     request once per worker, any error, and any call slower than the threshold.
+        # The cold-first line carries the breakdown itself, so that one request logs a SINGLE line -
+        # never a [COLDSTART] + [TIMING] pair. Every later warm request logs just the [TIMING] line.
         log = logging.getLogger("echo")
 
         started = time.perf_counter()
@@ -116,6 +137,17 @@ class EchoFortuneModel(mlflow.pyfunc.PythonModel):
                 rows = model_input
             spans["parse_input"] = (time.perf_counter() - t) * 1000.0
 
+            # DEMO pipeline: stand-ins for the utilities a real predict() calls before it answers.
+            # Each has a tiny baseline cost and can independently SPIKE (slow warehouse read, cold
+            # connection pool, slow downstream call) - that is what trips "[REQUEST] slow". Each is
+            # its OWN span, so the breakdown pinpoints WHICH utility was slow. Delete when you copy.
+            for step in self.SIMULATED_STEPS:
+                t = time.perf_counter()
+                time.sleep(random.uniform(*self.STEP_BASELINE_SECONDS))
+                if random.random() < self.STEP_SPIKE_PROBABILITY:
+                    time.sleep(self.STEP_SPIKE_SECONDS)
+                spans[step] = (time.perf_counter() - t) * 1000.0
+
             t = time.perf_counter()
             out = []
             for r in rows:
@@ -130,18 +162,18 @@ class EchoFortuneModel(mlflow.pyfunc.PythonModel):
         finally:
             latency_ms = (time.perf_counter() - started) * 1000.0
             threshold_ms = self.SLOW_REQUEST_LOG_THRESHOLD_SECONDS * 1000.0
-            should_log = is_first or error is not None or latency_ms >= threshold_ms
-            if should_log:
-                # Build the phase breakdown ONLY when a branch below will log it - the warm-success
-                # path never reaches here, so it pays nothing for formatting it does not use.
+            # Do the logging work only if a line will actually come out: the cold-first request, an
+            # error, a slow call (all WARNING), OR any request while DEBUG is on (the per-request
+            # [TIMING] line). A warm success with DEBUG off - production at INFO - skips it entirely.
+            if is_first or error is not None or latency_ms >= threshold_ms or log.isEnabledFor(logging.DEBUG):
                 total = sum(spans.values()) or 1.0
                 breakdown = " ".join(
                     f"{k}={spans[k]:.3f}ms({100 * spans[k] / total:.0f}%)" for k in spans
                 )
                 if is_first:
-                    # The cold-first line, folding in what the old worker_boot line carried. LATENCY is
-                    # the cold signal (not seconds_since_boot); the true caller-felt wait is measured
-                    # OUTSIDE at the facade, here we only MARK the cold-first for correlation.
+                    # Cold-first: WARNING (shows at any level), with the breakdown baked in, so this
+                    # one request logs a single line - no separate [TIMING]. latency_ms is the cold
+                    # signal; the true caller-felt wait is measured OUTSIDE at the facade.
                     log.warning(
                         "[COLDSTART] first request after boot: pid=%d latency_ms=%.1f status=%s | %s",
                         os.getpid(), latency_ms, "error" if error else "ok", breakdown,
@@ -151,10 +183,17 @@ class EchoFortuneModel(mlflow.pyfunc.PythonModel):
                         "[REQUEST] error latency_ms=%.1f error_type=%s | %s",
                         latency_ms, type(error).__name__, breakdown,
                     )
-                else:
+                elif latency_ms >= threshold_ms:
+                    # Slow: WARNING, so it surfaces even in production where the DEBUG timing is off.
                     log.warning(
                         "[REQUEST] slow latency_ms=%.1f threshold_ms=%.1f | %s",
                         latency_ms, threshold_ms, breakdown,
+                    )
+                else:
+                    # Every normal warm request (DEBUG only): the per-step timing breakdown - the
+                    # copy-paste recipe your own SQL reads / pool waits / LLM calls would use.
+                    log.debug(
+                        "[TIMING] total=%.3fms latency_ms=%.1f | %s", total, latency_ms, breakdown,
                     )
 
 
