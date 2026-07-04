@@ -16,3 +16,7 @@ mlruns/
 
 work/
 print/
+
+.databricks
+.vscode/settings.json
+databricks.yml
